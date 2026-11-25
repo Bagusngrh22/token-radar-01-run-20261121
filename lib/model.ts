@@ -1,24 +1,32 @@
-// Token Radar, model radar-3 — written in this session.
-// One sealed snapshot in, one ranked board out. Nothing here names a
-// protocol in advance: every number below is derived from the snapshot
-// itself, and the same scoring function runs over every candidate.
+// Token Radar, model radar-4 — revised in this session.
+// One sealed snapshot in, one ranked board out. No protocol is named
+// in advance: every figure below is read from the snapshot itself,
+// and the same scoring routine runs over every candidate.
 //
-// How a protocol earns its implied value
-//   market multiple: for each category, the median (market cap / TVL) of
-//     the protocols in that category that already trade, read from this
-//     snapshot. A thin category (fewer than 5 live names) borrows the
-//     snapshot-wide median instead. Clamped to [0.05, 1.00].
-//   reach: 1 + 0.02 for each chain beyond the first, capped at 5 extra.
-//   momentum: 1 + 0.5 * clamp(change_7d, -60, +120) / 100.
-//   staying power: 0.60 + 0.40 * min(age_days, 1095) / 1095; a protocol
-//     with no listing date is scored as 365 days old.
-//   implied = round(TVL * market multiple * reach * momentum * staying power)
-// A protocol is rankable when the snapshot records no token for it
-// (mcap, gecko id and symbol all null), it is not a CEX, and its name
+// A row's implied value, in the order the factors multiply:
+//   TVL x category multiple x chain reach x weekly growth
+//     x staying power x screen factor
+//   category multiple: median (market cap / TVL) of the protocols in
+//     the same category that already trade, from this snapshot. A
+//     category with fewer than 4 live names borrows the snapshot-wide
+//     median instead. Clamped to [0.04, 1.20].
+//   chain reach: 1 + 0.03 for each chain beyond the first, up to 6.
+//   weekly growth: 1 + 0.6 * clamp(change_7d, -50, +150) / 100.
+//   staying power: 0.55 + 0.45 * min(age_days, 1095) / 1095. A
+//     protocol with no listing date is scored as 365 days old —
+//     age is how long it has run with no token, and a longer run
+//     with no token is worth more, not less.
+//   screen factor: 1.05 when the protocol is on the snapshot's own
+//     watchlist (it passed the house rule: no token recorded, and
+//     not a wrapped, staked or bridged product of one that trades),
+//     1.00 otherwise. The watchlist is a snapshot fact, not a name.
+//   implied = round(TVL * all of the above), at least $1.
+// Rankable means the snapshot records no token (market cap, gecko
+// id and symbol all null), the category is not CEX, and the name
 // does not end in a version marker. Live-token protocols are never
-// ranked; the 24 largest by market cap are shown separately, at the
-// market's own price, so the board never mixes a model's guess with a
-// traded value.
+// ranked; the 24 largest by market cap are set aside in their own
+// tab, at the market's own price, so the board never mixes a model's
+// guess with a traded value.
 
 export interface SnapshotProtocol {
   slug: string;
@@ -54,24 +62,28 @@ export interface ModelTuning {
   multipleLow: number;
   multipleHigh: number;
   minLiveForOwnMultiple: number;
+  watchlistFactor: number;
+  earlyFactor: number;
 }
 
 export const TUNING: ModelTuning = {
-  momentumWeight: 0.5,
-  growthLow: -60,
-  growthHigh: 120,
-  stayingBase: 0.6,
-  stayingSpan: 0.4,
+  momentumWeight: 0.6,
+  growthLow: -50,
+  growthHigh: 150,
+  stayingBase: 0.55,
+  stayingSpan: 0.45,
   stayingDays: 1095,
   ageWhenUnknown: 365,
-  reachPerChain: 0.02,
-  reachCapChains: 5,
-  multipleLow: 0.05,
-  multipleHigh: 1.0,
-  minLiveForOwnMultiple: 5,
+  reachPerChain: 0.03,
+  reachCapChains: 6,
+  multipleLow: 0.04,
+  multipleHigh: 1.2,
+  minLiveForOwnMultiple: 4,
+  watchlistFactor: 1.05,
+  earlyFactor: 1.0,
 };
 
-export const MODEL_VERSION = "radar-3";
+export const MODEL_VERSION = "radar-4";
 export const LIVE_SHOWN = 24;
 /** No cap on early rows: every rankable pre-token protocol below the floor joins the board. */
 export const EARLY_CAP = 400;
@@ -103,11 +115,13 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    screen_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
   tvl_rank: number;
   on_watchlist: boolean;
+  top_driver: string;
 }
 
 export interface RadarRow {
@@ -126,8 +140,10 @@ export interface RadarRow {
   maturity_multiplier: number;
   category_multiple: number;
   chain_multiplier: number;
+  screen_multiplier: number;
   tvl_rank: number;
   on_watchlist: boolean;
+  top_driver: string;
 }
 
 export interface LiveRow {
@@ -219,24 +235,6 @@ export function categoryMultiples(
   return { byCategory, global };
 }
 
-/**
- * One line a reader can check: every factor that went into a row's
- * implied value, in the order the formula multiplies them.
- */
-export function explainScore(
-  p: SnapshotProtocol,
-  asOf: string,
-  tune: ModelTuning,
-  multiples: { byCategory: Record<string, number>; global: number },
-): string {
-  const s = scoreProtocol(p, asOf, tune, multiples);
-  return (
-    `${p.name}: TVL $${p.tvl_usd.toLocaleString("en-US")} x category ${s.catMult.toFixed(4)}` +
-    ` x chains ${s.chainMult.toFixed(2)} x growth ${s.growthMult.toFixed(4)}` +
-    ` x maturity ${s.maturityMult.toFixed(4)} = $${s.implied.toLocaleString("en-US")}`
-  );
-}
-
 export function chainMultiplier(p: SnapshotProtocol, tune: ModelTuning): number {
   const extra = clamp(p.chains.length - 1, 0, tune.reachCapChains);
   return 1 + tune.reachPerChain * extra;
@@ -247,6 +245,7 @@ export function scoreProtocol(
   asOf: string,
   tune: ModelTuning,
   multiples: { byCategory: Record<string, number>; global: number },
+  onWatchlist: boolean,
 ): {
   implied: number;
   catMult: number;
@@ -254,6 +253,7 @@ export function scoreProtocol(
   growthPct: number;
   growthMult: number;
   maturityMult: number;
+  screenMult: number;
   age: number | null;
 } {
   const age = ageDays(asOf, p.listed_at);
@@ -268,11 +268,55 @@ export function scoreProtocol(
       ? multiples.byCategory[p.category]!
       : multiples.global;
   const chainMult = chainMultiplier(p, tune);
+  const screenMult = onWatchlist ? tune.watchlistFactor : tune.earlyFactor;
   const implied = Math.max(
     1,
-    Math.round(p.tvl_usd * catMult * chainMult * growthMult * maturityMult),
+    Math.round(p.tvl_usd * catMult * chainMult * growthMult * maturityMult * screenMult),
   );
-  return { implied, catMult, chainMult, growthPct, growthMult, maturityMult, age };
+  return { implied, catMult, chainMult, growthPct, growthMult, maturityMult, screenMult, age };
+}
+
+/** Which factor lifts this row most above 1 — the one-line reason for its rank. */
+export function topDriver(
+  catMult: number,
+  chainMult: number,
+  growthMult: number,
+  maturityMult: number,
+  screenMult: number,
+): string {
+  const drivers: Array<[string, number]> = [
+    ["category multiple", catMult],
+    ["chain reach", chainMult],
+    ["weekly growth", growthMult],
+    ["staying power", maturityMult],
+    ["watchlist screen", screenMult],
+  ];
+  drivers.sort((a, b) => b[1] - a[1]);
+  const best = drivers[0]!;
+  const drag = growthMult < 1 ? ` Weekly growth is a drag at ${growthMult.toFixed(2)}x.` : "";
+  if (best[1] <= 1.0)
+    return `TVL alone carries this row — every multiplier is at or below 1.00.${drag}`;
+  return `Strongest lift: ${best[0]} at ${best[1].toFixed(2)}x.${drag}`;
+}
+
+/**
+ * One line a reader can check: every factor that went into a row's
+ * implied value, in the order the formula multiplies them.
+ */
+export function explainScore(
+  p: SnapshotProtocol,
+  asOf: string,
+  tune: ModelTuning,
+  multiples: { byCategory: Record<string, number>; global: number },
+  onWatchlist: boolean,
+): string {
+  const s = scoreProtocol(p, asOf, tune, multiples, onWatchlist);
+  return (
+    `${p.name}: TVL $${p.tvl_usd.toLocaleString("en-US")} x category ${s.catMult.toFixed(4)}` +
+    ` x chains ${s.chainMult.toFixed(2)} x growth ${s.growthMult.toFixed(4)}` +
+    ` x maturity ${s.maturityMult.toFixed(4)} x screen ${s.screenMult.toFixed(2)}` +
+    ` = $${s.implied.toLocaleString("en-US")}`
+  );
 }
 
 const VERSIONED_NAME = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
@@ -311,10 +355,10 @@ export function buildBoard(snap: Snapshot, tune: ModelTuning = TUNING): BoardRow
   const tvlRank = new Map<string, number>();
   [...snap.protocols].sort(byTvl).forEach((p, i) => tvlRank.set(p.slug, i + 1));
 
-  const scored = [...chosen.values()].map((p) => ({
-    p,
-    ...scoreProtocol(p, snap.as_of, tune, multiples),
-  }));
+  const scored = [...chosen.values()].map((p) => {
+    const onWl = snap.watchlist.includes(p.slug);
+    return { p, onWl, ...scoreProtocol(p, snap.as_of, tune, multiples, onWl) };
+  });
   scored.sort(
     (a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0),
   );
@@ -339,11 +383,13 @@ export function buildBoard(snap: Snapshot, tune: ModelTuning = TUNING): BoardRow
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
+      screen_multiplier: s.screenMult,
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
     tvl_rank: tvlRank.get(s.p.slug) ?? 0,
-    on_watchlist: snap.watchlist.includes(s.p.slug),
+    on_watchlist: s.onWl,
+    top_driver: topDriver(s.catMult, s.chainMult, s.growthMult, s.maturityMult, s.screenMult),
   }));
 }
 
@@ -399,8 +445,30 @@ function coreAction(p: SnapshotProtocol, size: number, chain: string): string {
   return `Deposit $${size} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** A second, different action on the same protocol — a farmer with two touchpoints reads as real use. */
+function secondAction(p: SnapshotProtocol, size: number, chain: string): string {
+  const c = (p.category ?? "").toLowerCase();
+  const name = p.name;
+  const half = Math.max(10, Math.round(size / 2));
+  if (c.includes("lend") || c.includes("cdp"))
+    return `Borrow $${half} against the supplied collateral on ${name}, swap it back to USDC, and repay it within the week so the loan never sits idle.`;
+  if (c.includes("dex") || c.includes("yield"))
+    return `Swap $${half} through ${name} on ${chain} once a week, using a different pair each time, so the wallet shows trading as well as liquidity.`;
+  if (c.includes("bridge"))
+    return `Bridge $${half} back out through ${name} after a few days, then bridge it in again — one round trip, not a loop.`;
+  if (c.includes("staking") || c.includes("restak"))
+    return `Delegate a further $${half} through ${name} to a second validator or pool, so the stake is not a single line.`;
+  if (c.includes("perpetual") || c.includes("derivative"))
+    return `Close the first position on ${name} in profit or at a small loss, then open a fresh one half its size the next week.`;
+  if (c.includes("prediction"))
+    return `Settle the first market on ${name}, withdraw the winnings, and fund one new market with $${half}.`;
+  if (c.includes("curator") || c.includes("allocator"))
+    return `Move $${half} into a second ${name} vault with a different strategy, and compare the two vaults' returns weekly.`;
+  return `Use $${half} in a second feature of ${name} on ${chain} — a swap, a vote, or a second pool — so the wallet is not a one-action address.`;
+}
+
 /**
- * Seven farm steps, derived only from the protocol's own record
+ * Eight farm steps, derived only from the protocol's own record
  * (category, chains, TVL, age). Every step states its cost and time.
  */
 export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
@@ -415,6 +483,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: "5 minutes",
     },
     { text: coreAction(p, size, chain), cost: `$${size} of capital and about $${gas} of gas`, time: "15 minutes to set up" },
+    { text: secondAction(p, size, chain), cost: `about $${Math.max(10, Math.round(size / 2))} of capital and about $2 of gas`, time: "10 minutes" },
     {
       text: `Return once a week and do one real action — a deposit, a borrow, a swap or a vote — so the wallet reads as active, not dormant.`,
       cost: "about $2 of gas a week",
@@ -476,8 +545,10 @@ export function radarRow(row: BoardRow): RadarRow {
     maturity_multiplier: row.model.maturity_multiplier,
     category_multiple: row.model.category_multiple,
     chain_multiplier: row.model.chain_multiplier,
+    screen_multiplier: row.model.screen_multiplier,
     tvl_rank: row.tvl_rank,
     on_watchlist: row.on_watchlist,
+    top_driver: row.top_driver,
   };
 }
 
@@ -563,7 +634,9 @@ export function parseSnapshot(text: string): Snapshot {
 
 /** The gate's own checks, in miniature: null when this board would pass them. */
 export function boardIssue(board: BoardRow[], snap: Snapshot): string | null {
+  if (board.length < 100) return `the board holds ${board.length} rows, below the 100-row floor`;
   const slugs = new Set(board.map((r) => r.slug));
+  if (slugs.size !== board.length) return "the board repeats a slug";
   const missing = snap.watchlist.filter((s) => !slugs.has(s));
   if (missing.length > 0)
     return `the board misses ${missing.length} watchlist slug${missing.length === 1 ? "" : "s"}: ${missing.slice(0, 5).join(", ")}`;
